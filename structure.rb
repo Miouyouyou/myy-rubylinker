@@ -133,6 +133,11 @@ class CStruct
 			@elements ||= (superclass.elements!.clone rescue {})
 		end
 		
+    # TODO
+    #
+    # If a C structure contains pointers, that is addresses pointing 
+    # to allocated data, the size of the C structure must only take 
+    # into account the size of the address.
 		def size!
 			@elements.values.map(&:size!).inject(0) {|total,size| total + size}
 		end
@@ -142,12 +147,21 @@ class CStruct
 			
 			(class << self; self; end).instance_eval do
 				# class S; type :uchar; end defines S.uchar :element_name[, array: n] ...
-				define_method(nom_type.to_sym) do |nom_element, array: nil|
+				define_method(nom_type.to_sym) do |raw_nom_element, array: nil|
 					
+          nom_element = raw_nom_element.to_sym
 					# ... which add the element to @elements on invocation
-					elements![nom_element.to_sym] = element_impl.new(type, array: array)
+					elements![nom_element] = element_impl.new(type, array: array)
 					# ... which defines an instance method 'element_name', for S instances
-					attr_accessor nom_element.to_sym
+          
+					attr_writer nom_element
+          
+          # This add the possibility to use blocks as values
+          define_method(nom_element) do
+            v = instance_variable_get(:"@#{nom_element}")
+            return v unless v.respond_to? :call
+            v.call(self)
+          end
 					
 				end
 			end
@@ -178,6 +192,11 @@ class CStruct
           i = s
         end
       end
+    end
+    
+    def set!(hsh)
+      s = self.new
+      s.set!(hsh)
     end
 				
 	end
@@ -218,23 +237,73 @@ class CStruct
 	typedef :le_float,  :float
 	typedef :le_double, :double
 	
+  def initialize(fail_fast: false)
+    @fail_fast = fail_fast
+    @failures = {
+      false => Proc.new do |field_name, exception, failed_fields|
+        failed_fields << {field_name: field_name, exception: exception}
+    end,
+      true =>  Proc.new do |field_name, exception|
+        raise e, "The following exception occured when dealing with #{field_name}"<<
+                 exception.message
+    end
+    }
+  end
+  
 	def memset!(stream)
 		self.class.elements!.each do |field_name, field_object|
 			self.__send__ :"#{field_name}=", field_object.read(stream)
 		end
 	end
 	
+  class NullStream
+    def write(*args)
+    end
+  end
+  @@null_stream = NullStream.new
+  
 	def memwrite!(stream)
-		self.class.elements!.each do |field_name, field_object|
-			value = self.__send__(:"#{field_name}")
-			field_object.write(stream, value)
-		end
+    
+    # 75% of the complexity is due to error management.
+    
+    failed_fields = []
+    fail_procedure = @failures[@fail_fast]
+    
+    self.class.elements!.each do |field_name, field_object|
+      begin
+        current_field = field_name
+        value = self.__send__(:"#{current_field}")
+        field_object.write(stream, value)
+      rescue => e
+        fail_procedure.call(field_name, e, failed_fields)
+        stream = @@null_stream
+      end
+    end
+    
+    if failed_fields.empty?
+      return
+    else
+      error = "Could not write the structure after the following field : #{failed_fields.first[:field_name]}\n"<<
+              "The following exceptions happened during the operation.\n"
+      failed_fields.each do |problems|
+        error << "#{problems[:field_name]} : #{problems[:exception].class} - #{problems[:exception].message} (#{problems[:exception].backtrace[0]})\n"
+      end
+      raise RuntimeError, error
+    end
+    
 	end
   
   def set!(hsh)
     hsh.each {|field, value| self.send(:"#{field}=", value) }
+    self
   end
+  
+  def size!
+    self.class.size!
+  end
+  
 end
+
 
 
 class ElfHdr64 < CStruct
@@ -268,6 +337,13 @@ class Elf32 < CStruct
 end
 
 class ElfHdr32 < Elf32
+  enum [
+    :ET_NONE,
+    :ET_REL,
+    :ET_EXEC,
+    :ET_DYN,
+    :ET_CORE
+  ]
 	EI_NIDENT = 16;
 	uchar :e_ident, array: EI_NIDENT;
 	Elf_Half :e_type;
@@ -296,6 +372,9 @@ class ElfPHdr32 < Elf32
     :PT_PHDR, 
     :PT_TLS
   ]
+  PF_X = 0x1
+  PF_W = 0x2
+  PF_R = 0x4
 	Elf_Word :p_type;
 	Elf_Off  :p_offset;
 	Elf_Addr :p_vaddr;
@@ -399,6 +478,22 @@ class Elf32_Rela < Elf32_Rel
 end
 
 require 'stringio'
+class SectionInformations
+  INVALID = ""
+  attr_accessor :name
+  attr_accessor :header
+  attr_accessor :data
+  
+  def initialize(name: nil, header: nil, data: nil)
+    @name   = name
+    @header = header
+    @data   = data
+  end
+  
+  def data!
+    StringIO.new(data)
+  end
+end
 class ElfReader32
 	
 	attr_reader :header
@@ -407,18 +502,6 @@ class ElfReader32
 	attr_reader :named_sections
 	attr_reader :symbols
 	attr_reader :relocations
-	
-	
-	class SectionInformations
-		INVALID = ""
-		attr_accessor :name
-		attr_accessor :header
-		attr_accessor :data
-		
-		def data!
-			StringIO.new(data)
-		end
-	end
 	
 	def initialize(stream:)
 		@header = ElfHdr32.from!(stream)
@@ -473,16 +556,35 @@ class ElfReader32
 	end
 end
 
+class Structures < Hash
+  def initialize(structures_type)
+    @structures_type = structures_type
+  end
+  
+  def []=(name, value)
+    if value.is_a? @structures_type
+      super(name, value)
+    else
+      raise ArgumentError, "Expected a #{@structures_type.inspect} value, got a #{value.class.inspect}"
+    end
+  end
+  
+  def size!
+    @structures_type.size! * self.length
+  end
+end
+
 class ArmElf
 	
+  EM_ARM = 40
+  
 	attr_accessor :data
   attr_accessor :text
   
-  attr_accessor :main_header
-  attr_accessor :program_headers
-  attr_accessor :program_data
-  attr_accessor :sections_headers
-  attr_accessor :sections_data
+  attr_accessor :header
+  attr_accessor :phdr
+  attr_accessor :shdr
+  attr_accessor :sections_names
   
   @@defaults = {
     data_offset: 0x20000,
@@ -502,95 +604,10 @@ class ArmElf
     sh_entsize: 0
   }
   def init_shdr(params = {})
-    sh = ElfSHdr32.new
-    sh.set!(@@empty_pshdr.merge(params))
-    sh
+    ElfSHdr32.set!(@@empty_pshdr.merge(params))
   end
   
-	def initialize
-    
-    @layout = [:main_header, :program_headers, :program_data, 
-               :sections_headers, :sections_data]
-    
-		@header = ElfHdr32.new
-		@header.e_ident   = [127, 69, 76, 70, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-		@header.e_type    = 2
-		@header.e_machine = 40
-		@header.e_version = 1
-    @header.e_flags   = 0x5000202
-    @header.e_ehbits  = ElfHdr32.size!
-    
-    @phdr = {}
-    # dh : data header
-    dh = ElfPHdr32.new
-    dh.p_type   = ElfPHdr32::PT_LOAD
-    dh.p_offset = ElfHdr32.size! + ElfPHdr32.size! * 2
-    dh.p_vaddr  = 0x20000 + dh.p_offset
-    dh.p_paddr  = dh.p_vaddr
-    dh.p_flags  = 6
-    dh.p_align  = 0x10000
-    
-    th = ElfPHdr32.new
-    th.p_type   = ElfPHdr32::PT_LOAD
-    th.p_offset = 0
-    th.p_vaddr  = 0x10000
-    th.p_paddr  = 0x10000
-    th.p_flags  = 5
-    th.p_align  = 0x10000
-    
-    @phdr[".data"] = dh
-    @phdr[".text"] = th
-    
-    # Are empty and shstrtab useful ?
-    @shdr = {}
-    @shdr[""] = init_shdr
-    #<ElfSHdr32:0x0055d04949cf18 @sh_name=17, @sh_type=1, @sh_flags=3, @sh_addr=131268, @sh_offset=196, @sh_size=24, @sh_link=0, @sh_info=0, @sh_addralign=1, @sh_entsize=0>
-    #<ElfPHdr32:0x0055d04949e7c8 @p_type=1, @p_offset=196, @p_vaddr=131268, @p_paddr=131268, @p_filesz=24, @p_memsz=24, @p_flags=6, @p_align=65536>
-
-    dsh = init_shdr(
-      sh_type: ElfSHdr32::SHT_PROGBITS,
-      sh_flags: ElfSHdr32::SHF_ALLOC | ElfSHdr32::SHF_WRITE, 
-      sh_addr: dh.p_vaddr + dh.p_offset,
-      sh_offset: dh.p_offset,
-      sh_align: 1
-    )
-
-    #<ElfSHdr32:0x0055d04949d580 @sh_name=11, @sh_type=1, @sh_flags=6, @sh_addr=65684, @sh_offset=148, @sh_size=48, @sh_link=0, @sh_info=0, @sh_addralign=4, @sh_entsize=0>
-    #<ElfPHdr32:0x0055d04949ee30 @p_type=1, @p_offset=0, @p_vaddr=65536, @p_paddr=65536, @p_filesz=196, @p_memsz=196, @p_flags=5, @p_align=65536>
-    tsh = init_shdr(
-      sh_type: ElfSHdr32::SHT_PROGBITS,
-      sh_flags: ElfSHdr32::SHF_ALLOC | ElfSHdr32::SHF_EXECINSTR, 
-      sh_addr: th.p_vaddr,
-      sh_offset: th.p_offset,
-      sh_align: 4
-    )
-    
-    shstrtab = init_shdr(
-      sh_type: ElfSHdr32::SHT_STRTAB,
-      sh_addralign: 1
-    )
-    
-    @shdr[".data"] = dsh
-    @shdr[".text"] = tsh
-    @shdr[".shstrtab"] = shstrtab
-  end
-  
-  def data=(d)
-    @data = d
-    d.start_address = @phdr[".data"].p_vaddr
-  end
-  
-  def generate
-    dh = @phdr[".data"]
-    dsh = @shdr[".data"]
-    dsh.sh_size = dh.p_filesz = dh.p_memsz = data.size!
-        
-    th = @phdr[".text"]
-    tsh = @shdr[".text"]
-    tsh.sh_size = text.size!
-    tsh.sh_addr += tsh.sh_offset = ElfHdr32.size! + ElfPHdr32.size! * @phdr.length + dh.p_filesz
-    th.p_memsz = th.p_filesz = tsh.sh_offset + text.size!
-    
+  def section_names
     keynames = ""
     @shdr.keys.each do |name|
       @shdr[name].sh_name = keynames.length
@@ -598,11 +615,176 @@ class ArmElf
       keynames << "\0"
     end
     keynames << ("\0" * (keynames.length % 4))
-    @shdr[".shstrtab"].sh_size = keynames.length
+    keynames
+  end
+  
+	def initialize
     
-    @header.e_entry  = tsh.sh_addr
-    @header.e_phoff  = ElfHdr32.size!
-    @header.e_shoff  = th.p_memsz
+    @layout = [:header, :phdr, :text, :data,
+               :shdr, :shstrtab]
+    
+		@header = ElfHdr32.new
+    @header.set!(
+      e_ident:   [127, 69, 76, 70, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      e_type:    ElfHdr32::ET_EXEC,
+		  e_machine: EM_ARM,
+      e_version: 1,
+      e_flags:   0x5000202,
+      e_ehbits:  ElfHdr32.size!
+    )
+    
+    @program_headers = {}
+    @phdr = Structures.new(ElfPHdr32)
+    # dh : data header
+    dh = ElfPHdr32.set!(
+      p_type:  ElfPHdr32::PT_LOAD,
+      p_flags: ElfPHdr32::PF_W | ElfPHdr32::PF_R,
+      p_align: 0x10000
+    )
+       
+    th = ElfPHdr32.set!(
+      p_type:  ElfPHdr32::PT_LOAD,
+      p_flags: ElfPHdr32::PF_X | ElfPHdr32::PF_R,
+      p_align: 0x10000
+    )
+    
+    @phdr[".data"] = dh
+    @phdr[".text"] = th
+    
+    # Are empty and shstrtab useful ?
+    @sections_headers = {}
+    @shdr = Structures.new(ElfSHdr32)
+    @shdr[""] = init_shdr
+
+    dsh = init_shdr(
+      sh_type: ElfSHdr32::SHT_PROGBITS,
+      sh_flags: ElfSHdr32::SHF_ALLOC | ElfSHdr32::SHF_WRITE, 
+      sh_addralign: 1
+    )
+
+    tsh = init_shdr(
+      sh_type: ElfSHdr32::SHT_PROGBITS,
+      sh_flags: ElfSHdr32::SHF_ALLOC | ElfSHdr32::SHF_EXECINSTR, 
+      sh_addralign: 4
+    )
+    
+    sections_strtab = init_shdr(
+      sh_type: ElfSHdr32::SHT_STRTAB,
+      sh_addralign: 1
+    )
+    
+    @shdr[".data"] = dsh
+    @shdr[".text"] = tsh
+    @shdr[".shstrtab"] = sections_strtab
+    
+    [@phdr, @program_headers, @shdr, @sections_headers].each_slice(2) do |headers, metadata|
+      headers.each do |name, properties|
+        metadata[name] = SectionInformations.new(name: name, header: properties)
+      end
+    end
+    @program_headers.each do |section, metadata|
+      metadata.header.p_filesz = metadata.header.p_memsz =
+          Proc.new { metadata.data.size! }
+      metadata.header.p_offset = Proc.new { self.offset_of(section[1..-1].to_sym) }
+    end
+    @sections_headers.each do |section, metadata|
+      if section != ""
+        metadata.header.sh_size = Proc.new { sizeof(metadata.data) }
+        metadata.header.sh_name = Proc.new { i = shstrtab.index(section); puts "Index : #{i}"; i }
+        metadata.header.sh_offset = Proc.new { self.offset_of(section[1..-1].to_sym) }
+      end
+    end
+    @shstrtab = ""
+    @sections_headers[".shstrtab"].data = @shstrtab
+    
+  end
+  
+  def data=(d)
+    @program_headers[".data"].data = @sections_headers[".data"].data = @data = d
+    d.start_address =
+        @sections_headers[".data"].header.sh_addr = 
+        @program_headers[".data"].header.p_vaddr = 
+        @program_headers[".data"].header.p_paddr =
+        Proc.new { @@defaults[:data_offset] + offset_of(:data) }
+     
+  end
+  
+  def text=(t)
+    @program_headers[".text"].data = @sections_headers[".text"].data = @text = t
+    @program_headers[".text"].header.p_filesz = @program_headers[".text"].header.p_memsz =
+        Proc.new { self.offset_of(:text) + t.size! }
+    @program_headers[".text"].header.p_vaddr = 
+        @program_headers[".text"].header.p_paddr =
+        @@defaults[:text_offset]
+    @sections_headers[".text"].header.sh_addr =
+        @@defaults[:text_offset] + offset_of(:text)
+    @program_headers[".text"].header.p_offset = 0
+  end
+  
+  def shstrtab
+    names = ""
+    @sections_headers.keys.each do |name|
+      names << name + "\0"
+      names << "\0" * (names.length % 4)
+    end
+    @shstrtab.replace names
+    @shstrtab
+  end
+        
+  
+  def offset_of(element)
+    @layout[0...@layout.index(element)].inject(0) do |total_size, part|
+      puts "Offset of : #{element}"
+      total_size + sizeof(self.send(part))
+    end
+  end
+  
+  def sizeof(element)
+    return element.size! if element.respond_to? :size!
+    case element
+    when String
+      element.length
+    when Hash
+      values = element.values
+      values.length * values.first.class.size!
+    else
+      puts "Unknown type : #{element.class}"
+      0
+    end
+  end
+  
+  def write(element, stream)
+    return element.memwrite!(stream) if element.respond_to? :memwrite!
+    return element.write!(stream) if element.respond_to? :write!
+    
+    case element
+    when Hash
+      element.values.each {|h| h.memwrite!(stream)}
+    when String
+      stream.write(element)
+    else
+      raise ArgumentError, "Don't know how to write #{element.class}"
+    end
+  end
+  
+  def generate
+    
+    p ElfSHdr32.size!
+    # 1st pass : Calculate sizes
+    sizes = {}
+    @layout.each do |part_name|
+      p part_name
+      sizes[part_name] = sizeof(self.send(part_name))
+      
+    end
+    
+    p sizes
+
+    self.shstrtab
+    
+    @header.e_entry  = @shdr[".text"].sh_addr
+    @header.e_phoff  = offset_of(:phdr)
+    @header.e_shoff  = offset_of(:shdr)
     @header.e_ehbits = ElfHdr32.size!
     @header.e_phentsize = ElfPHdr32.size!
     @header.e_phnum  = @phdr.length
@@ -610,18 +792,16 @@ class ArmElf
     @header.e_shnum  = @shdr.length
     @header.e_shstrndx = @shdr.keys.index(".shstrtab")
     
-    @shdr[".shstrtab"].sh_offset = @header.e_shoff + @header.e_shentsize * @header.e_shnum
-    puts "%x" % th.p_memsz
-    puts "%x" % @header.e_shoff
-    puts "%x" % @shdr[".shstrtab"].sh_offset
+#     puts "%x" % th.p_memsz
+#     puts "%x" % @header.e_shoff
+#     puts "%x" % @shdr[".shstrtab"].sh_offset
     
     elf = StringIO.new("", "w+")
-    @header.memwrite!(elf)
-    @phdr.values.each {|h| h.memwrite!(elf)}
-    data.write!(elf)
-    text.write!(elf)
-    @shdr.values.each {|h| h.memwrite!(elf)}
-    elf.write(keynames)
+    @layout.each do |part|
+      d = self.send(part)
+      puts "#{part} : #{p.inspect}"
+      write(d, elf)
+    end
     
     File.write("elf_test", elf.string)
     elf.close
@@ -631,5 +811,4 @@ class ArmElf
 end
 
 # out_file.write("\x00")
-
 
