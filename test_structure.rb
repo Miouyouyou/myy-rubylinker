@@ -46,7 +46,7 @@ class TestStruct < Minitest::Test
     assert_equal 0x22, elf.e_shstrndx
     file.close
   end
-  
+
   def test_write
     elf = TestHeader.new
     File.open("ohmydoginou", "r") do |f|
@@ -60,17 +60,17 @@ class TestStruct < Minitest::Test
       new_elf.memset!(f)
     end
     TestHeader.elements!.each do |field_name, field_object|
-      assert_equal elf.send(field_name.to_sym), new_elf.send(field_name.to_sym) 
+      assert_equal elf.send(field_name.to_sym), new_elf.send(field_name.to_sym)
     end
   end
-  
+
   class AS < CStruct
     uint32_t :a;
     uint32_t :b;
     uint16_t :c;
     uint16_t :d;
   end
-  
+
   def test_reading_blocks
     h = AS.new
     h.a = 2
@@ -85,7 +85,7 @@ class TestStruct < Minitest::Test
     h.memwrite!(n)
     p n.string
   end
-  
+
   def test_size!
     h = TestHeader.new
     assert_equal 64, TestHeader.size!
